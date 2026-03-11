@@ -1,2 +1,7 @@
 python-telegram-bot
-Pillow
+flask
+gunicorn
+pymupdf
+rembg
+pillow
+ethiopian-date
