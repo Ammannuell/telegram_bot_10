@@ -1,6 +1,7 @@
 import sqlite3
 import fitz
 import os
+from flask import Flask, request  # Add this
 import re
 import io
 import asyncio
@@ -17,6 +18,22 @@ TELEBIRR_NUMBER = "+251912661298"
 BOT_TOKEN = "8297764475:AAHKYCyrVfkC5Ghvwhec8aQoOmsueY8n8hg"
 # ADD THIS LINE:
 REMBG_SESSION = new_session()
+
+# flask
+# --- ADD THIS BLOCK ---
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return "Bot is alive!", 200
+
+@flask_app.route('/webhook', methods=['POST'])
+async def webhook():
+    update = Update.de_json(request.get_json(force=True), app.bot)
+    await app.process_update(update)
+    return "ok", 200
+# ----------------------
+
 # Conversation States
 MENU, BUY_PACK, WAIT_RECEIPT = range(3)
 
@@ -304,11 +321,16 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if os.path.exists(f): os.remove(f)
 
 
-# 6. MAIN
 
+
+# ADD THIS NEW BLOCK
 if __name__ == "__main__":
     init_db()
+    
+    # We make 'app' global so the webhook route can see it
+    global app
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
     conv = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -318,7 +340,23 @@ if __name__ == "__main__":
         },
         fallbacks=[CommandHandler('start', start)]
     )
+    
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(admin_approval, pattern="^(appr|rej)_"))
-    print("🚀 Bot running...")
-    app.run_polling()
+
+    # Render Logic
+    PORT = int(os.environ.get("PORT", 10000))
+    # If RENDER_EXTERNAL_URL exists, we are on the cloud
+    URL = os.environ.get("RENDER_EXTERNAL_URL") 
+
+    if URL:
+        print(f"🚀 Deployment Mode: Webhook on {URL}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=f"{URL}/webhook"
+        )
+    else:
+        print("🚀 Local Mode: Polling")
+        app.run_polling()
