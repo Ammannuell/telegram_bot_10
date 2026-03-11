@@ -1,0 +1,324 @@
+import sqlite3
+import fitz
+import os
+import re
+import io
+import asyncio
+from datetime import datetime
+from rembg import remove, new_session
+from PIL import Image, ImageDraw, ImageFont
+from ethiopian_date import EthiopianDateConverter
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
+
+# CONFIGURATION 
+ADMIN_ID = 971543891  
+TELEBIRR_NUMBER = "+251912661298"
+BOT_TOKEN = "8297764475:AAHKYCyrVfkC5Ghvwhec8aQoOmsueY8n8hg"
+# ADD THIS LINE:
+REMBG_SESSION = new_session()
+# Conversation States
+MENU, BUY_PACK, WAIT_RECEIPT = range(3)
+
+
+# 1. DATABASE LOGIC
+
+def init_db():
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users 
+                 (user_id INTEGER PRIMARY KEY, credits INTEGER DEFAULT 0)''')
+    conn.commit()
+    conn.close()
+
+def get_credits(user_id):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("SELECT credits FROM users WHERE user_id=?", (user_id,))
+    res = c.fetchone()
+    conn.close()
+    return res[0] if res else 0
+
+def add_credits(user_id, amount):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, credits) VALUES (?, 0)", (user_id,))
+    c.execute("UPDATE users SET credits = credits + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+    conn.close()
+
+
+# 2. PDF & ID LOGIC (Preserving your exact extraction)
+
+def get_next_serial_number():
+    filename = "serial_counter.txt"
+    if not os.path.exists(filename):
+        with open(filename, "w") as f:
+            f.write("7000000")
+            return "7000000"
+    with open(filename, "r") as f:
+        content = f.read().strip()
+        current_sn = int(content) if content else 7000000
+    next_sn = current_sn + 1
+    with open(filename, "w") as f:
+        f.write(str(next_sn))
+    return str(next_sn)
+
+def extract_data_from_pdf(pdf_path, user_id):
+    if not os.path.exists(pdf_path): return None
+    doc = fitz.open(pdf_path)
+    page = doc[0]
+
+    paths = {'photo': f"photo_{user_id}.png", 'qr': f"qr_{user_id}.png", 
+             'barcode': f"barcode_{user_id}.png", 'fin': f"fin_{user_id}.png"}
+
+    image_list = page.get_images(full=True)
+    for i, img in enumerate(image_list):
+        xref = img[0]
+        pix = fitz.Pixmap(doc, xref)
+        if pix.n - pix.alpha > 3: pix = fitz.Pixmap(fitz.csRGB, pix)
+        
+        if i == 0:
+            img_data = pix.tobytes("png")
+            output_image = remove(Image.open(io.BytesIO(img_data)), session=REMBG_SESSION)
+            output_image.save(paths['photo'])
+        elif i == 1: pix.save(paths['qr'])
+        elif i == 2:
+            img_pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            w, h = img_pil.size
+            barcode_box = (int(w*(590/w)), int(h*(2695/h)), int(w*(1300/w)), int(h*(2900/h)))
+            img_pil.crop(barcode_box).save(paths['barcode'])
+
+    page.get_pixmap(clip=fitz.Rect(496.5, 493, 540, 501), matrix=fitz.Matrix(4, 4)).save(paths['fin'])
+    
+    text = page.get_text("text")
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    now = datetime.now()
+    eth_now = EthiopianDateConverter.to_ethiopian(now.year, now.month, now.day)
+    
+    data = {
+        'name_amh': lines[57] if len(lines) > 57 else "Unknown",
+        'name_eng': lines[58] if len(lines) > 58 else "Unknown",
+        'dob': f"{lines[43]} | {lines[44]}" if len(lines) > 44 else "Unknown",
+        'sex': f"{lines[45]} | {lines[46]}" if len(lines) > 46 else "Unknown",
+        'fan': "Unknown", 'sn': get_next_serial_number(),
+        'phone': lines[49] if len(lines) > 49 else "",
+        'address': lines[50:56],
+        'expiry': f"{now.day:02d}/{now.month:02d}/{now.year+10} | {eth_now.day:02d}/{eth_now.month:02d}/{eth_now.year+10}"
+    }
+    for line in lines:
+        clean = line.replace(" ", "")
+        fan_match = re.search(r'(\d{16})', clean)
+        if fan_match: data['fan'] = fan_match.group(1)
+    doc.close()
+    return data
+
+def generate_fayda_v3(data, output_path, user_id, mode="color"):
+    template_path = "Templet2.png" if os.path.exists("Templet2.png") else "Templet2.jpg"
+    if not os.path.exists(template_path): return False
+    canvas = Image.open(template_path).convert("RGBA")
+    draw = ImageDraw.Draw(canvas)
+    try:
+        f_amh, f_bold, f_small = ImageFont.truetype("nyala.ttf", 39), ImageFont.truetype("arialbd.ttf", 32), ImageFont.truetype("arialbd.ttf", 23)
+    except:
+        f_amh = f_bold = f_small = ImageFont.load_default()
+
+    # Dynamic Rotated Dates
+    now = datetime.now()
+    eth_conv = EthiopianDateConverter.to_ethiopian(now.year, now.month, now.day)
+    g_date = now.strftime("%d/%m/%Y")
+    e_date = f"{eth_conv.day:02d}/{eth_conv.month:02d}/{eth_conv.year}"
+
+    def draw_rotated_text(text, position, font):
+        text_img = Image.new("RGBA", (250, 60), (255, 255, 255, 0))
+        d = ImageDraw.Draw(text_img)
+        d.text((0, 0), text, font=font, fill="black")
+        rotated = text_img.rotate(90, expand=True)
+        canvas.paste(rotated, position, rotated)
+
+    draw_rotated_text(g_date, (22, 7), f_small)
+    draw_rotated_text(e_date, (22, 270), f_small)
+
+    # Photo Logic
+    photo_path = f"photo_{user_id}.png"
+    if os.path.exists(photo_path):
+        raw_photo = Image.open(photo_path).convert("RGBA")
+        if mode == "bw":
+            r, g, b, alpha = raw_photo.split()
+            gray = raw_photo.convert("L")
+            raw_photo = Image.merge("RGBA", (gray, gray, gray, alpha))
+        canvas.paste(raw_photo.resize((330, 370)), (62, 180), raw_photo.resize((330, 370)))
+        ghost = raw_photo.resize((110, 130))
+        canvas.paste(ghost, (850, 480), ghost)
+
+    # Assets (QR, Barcode, Fingerprint)
+    for asset, size, pos in [(f"qr_{user_id}.png", (550, 540), (1496, 18)), (f"barcode_{user_id}.png", (300, 65), (453, 544)), (f"fin_{user_id}.png", (240, 50), (1230, 508))]:
+        if os.path.exists(asset):
+            img = Image.open(asset).resize(size).convert("RGBA")
+            canvas.paste(img, pos, img)
+
+    # Main Text Overlay
+    text_x = 402
+    draw.text((text_x, 180), data['name_amh'], font=f_amh, fill="black")
+    draw.text((text_x, 222), data['name_eng'], font=f_bold, fill="black")
+    draw.text((text_x, 310), data['dob'], font=f_bold, fill="black")
+    draw.text((text_x, 375), data['sex'], font=f_amh, fill="black")
+    draw.text((text_x, 447), data['expiry'], font=f_bold, fill="black")
+    draw.text((460, 512), data['fan'], font=f_bold, fill="black")
+    draw.text((canvas.width - 180, canvas.height - 55), data['sn'], font=f_bold, fill="black")
+
+    back_x, y_addr = (canvas.width // 2) + 46, 235
+    draw.text((back_x, 70), data['phone'], font=f_bold, fill="black")
+    for line in data['address']:
+        draw.text((back_x, y_addr), line, font=f_amh, fill="black")
+        y_addr += 40
+
+    canvas.convert("RGB").save(output_path, "PNG")
+    return True
+
+# ==========================================
+# 3. UI HELPERS
+# ==========================================
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🖨 Print ID", callback_data='print_id')],
+                                 [InlineKeyboardButton("💳 Buy Package", callback_data='buy_package')],
+                                 [InlineKeyboardButton("📞 Contact Help", callback_data='contact_help')]])
+
+def package_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("40 birr = 1 package", callback_data='pkg_1')],
+                                 [InlineKeyboardButton("500 birr = 25 packages", callback_data='pkg_20')],
+                                 [InlineKeyboardButton("1500 birr = 100 packages", callback_data='pkg_100')],
+                                 [InlineKeyboardButton("2000 birr = 155 packages", callback_data='pkg_150')]])
+
+
+# 4. BOT HANDLERS
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    credits = get_credits(user_id)
+    welcome = (
+        "Welcome to the National ID Fayda Printable Converter Service! 🎉\n\n"
+        "📑 **To get your printable ID card:**\n"
+        "1. Download the FAYDA ID pdf from FAYDA app  OR Telebirr \n"
+        "2. Send the downloaded PDF file here to this bot.\n\n"
+        "እንኳን ወደ ብሔራዊ መታወቂያ ፋይዳ ካርድ ሊታተም የሚችል መቀየሪያ አገልግሎት በደህና መጡ! 🎉\n"
+        "🪪 ሊታተም የሚችል መታወቂያ ካርድዎን ለማግኘት፡-\n"
+       "1. የFAYDA መታወቂያ ፒዲኤፍ ከFAYDA መተግበሪያ ወይም ከTelebirr ያውርዱ \n"
+       "2. የወረደውን የፒዲኤፍ ፋይል ወደዚህ ቦት ይላኩ።\n\n"
+       "Baga Gara Tajaajila Jijjiirraa Maxxanfamuu Danda'u FAYDA Eenyummaa Biyyaalessaatti dhuftan! 🎉\n\n" 
+"📑 NATIONAL ID  maxxanfamuu danda'u argachuuf:**\n" 
+"1. ID FAYDA pdf appii FAYDA YKN Telebirr irraa buufadhaa \n" 
+"2. Faayila PDF buufame as gara bot kanaatti ergi.\n\n"
+        f"💰 **Your Balance:** {credits} packages"
+    )
+    await update.message.reply_text(welcome, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+    return MENU
+
+async def button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == 'buy_package':
+        await query.edit_message_text("Select a package below 👇", reply_markup=package_keyboard())
+        return BUY_PACK
+    elif query.data == 'print_id':
+        await query.message.reply_text("Please send your Fayda PDF file now.")
+        return MENU
+    elif query.data == 'contact_help':
+        await query.message.reply_text("Support: @altleg")
+        return MENU
+
+async def select_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    pkg_map = {'pkg_1': '1', 'pkg_20': '20', 'pkg_100': '100', 'pkg_150': '150'}
+    context.user_data['pending_pkg'] = pkg_map[query.data]
+    await query.edit_message_text(f"Pay to **{TELEBIRR_NUMBER}** then send the SMS receipt here.")
+    return WAIT_RECEIPT
+
+async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    
+    # Get the username or fallback to First Name if they don't have one
+    user_name = f"@{user.username}" if user.username else user.first_name
+    
+    # Add Username to the admin message
+    admin_msg = (
+        f"🔔 New Payment\n"
+        f"👤 User: {user_name}\n"
+        f"🆔 ID: {user.id}\n"
+        f"📦 Pkg: {context.user_data.get('pending_pkg')}\n\n"
+        f"📝 SMS Receipt:\n{update.message.text}"
+    )
+    
+    btns = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"appr_{user.id}_{context.user_data.get('pending_pkg')}"), 
+        InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user.id}")
+    ]])
+    
+    await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, reply_markup=btns, parse_mode="Markdown")
+    await update.message.reply_text("Receipt sent for approval. / ደረሰኝዎ ለቁጥጥር ተልኳል።")
+    return MENU
+
+async def admin_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data.split("_")
+    if data[0] == "appr":
+        add_credits(int(data[1]), int(data[2]))
+        await context.bot.send_message(chat_id=int(data[1]), text="✅ Payment Approved!")
+    await query.edit_message_text("Done.")
+
+
+# 5. INTEGRATED PDF HANDLER
+
+async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if get_credits(user_id) < 1:
+        await update.message.reply_text("❌ Insufficient balance.", reply_markup=main_menu_keyboard())
+        return
+
+    msg = await update.message.reply_text("⏳ Processing...")
+    pdf_path = f"input_{user_id}.pdf"
+    file = await context.bot.get_file(update.message.document.file_id)
+    await file.download_to_drive(pdf_path)
+
+    try:
+        # FIXED: Run extraction in a background thread
+        data = await asyncio.to_thread(extract_data_from_pdf, pdf_path, user_id)
+        
+        if data:
+            c_out, b_out = f"C_{user_id}.png", f"B_{user_id}.png"
+            
+            # FIXED: Run generation in background threads
+            await asyncio.to_thread(generate_fayda_v3, data, c_out, user_id, "color")
+            await asyncio.to_thread(generate_fayda_v3, data, b_out, user_id, "bw")
+            
+            with open(c_out, 'rb') as f: await update.message.reply_document(f, filename="Fayda_Color.png")
+            with open(b_out, 'rb') as f: await update.message.reply_document(f, filename="Fayda_BW.png")
+            
+            add_credits(user_id, -1)
+            await msg.edit_text(f"✅ Success! 1 package deducted. Balance: {get_credits(user_id)}")
+        else:
+            await msg.edit_text("❌ Extraction failed.")
+    finally:
+        for f in [pdf_path, f"C_{user_id}.png", f"B_{user_id}.png", f"photo_{user_id}.png", f"qr_{user_id}.png", f"barcode_{user_id}.png", f"fin_{user_id}.png"]:
+            if os.path.exists(f): os.remove(f)
+
+
+# 6. MAIN
+
+if __name__ == "__main__":
+    init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    conv = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            MENU: [CallbackQueryHandler(button_tap), MessageHandler(filters.Document.PDF, handle_pdf)],
+            BUY_PACK: [CallbackQueryHandler(select_package)],
+            WAIT_RECEIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_receipt)]
+        },
+        fallbacks=[CommandHandler('start', start)]
+    )
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(admin_approval, pattern="^(appr|rej)_"))
+    print("🚀 Bot running...")
+    app.run_polling()
