@@ -23,16 +23,32 @@ REMBG_SESSION = new_session()
 # --- ADD THIS BLOCK ---
 flask_app = Flask(__name__)
 
+# 2. Define a placeholder for the bot app
+app = None
+
 @flask_app.route('/')
 def health_check():
     return "Bot is alive!", 200
 
 @flask_app.route('/webhook', methods=['POST'])
 async def webhook():
-    update = Update.de_json(request.get_json(force=True), app.bot)
-    await app.process_update(update)
+    global app
+    if app:
+        # Initialize and Start if not already running
+        if not app.updater: 
+            await app.initialize()
+            await app.start()
+            
+            # AUTO-SET WEBHOOK: This ensures Telegram knows where to send updates
+            URL = os.environ.get("RENDER_EXTERNAL_URL")
+            if URL:
+                await app.bot.set_webhook(url=f"{URL}/webhook")
+            
+        data = request.get_json(force=True)
+        update = Update.de_json(data, app.bot)
+        await app.process_update(update)
+        
     return "ok", 200
-# ----------------------
 
 # Conversation States
 MENU, BUY_PACK, WAIT_RECEIPT = range(3)
@@ -324,39 +340,46 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ADD THIS NEW BLOCK
-if __name__ == "__main__":
-    init_db()
-    
-    # We make 'app' global so the webhook route can see it
-    global app
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    conv = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            MENU: [CallbackQueryHandler(button_tap), MessageHandler(filters.Document.PDF, handle_pdf)],
-            BUY_PACK: [CallbackQueryHandler(select_package)],
-            WAIT_RECEIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_receipt)]
-        },
-        fallbacks=[CommandHandler('start', start)]
-    )
-    
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(admin_approval, pattern="^(appr|rej)_"))
+# 1. Initialize Database and Bot (OUTSIDE the main block)
+init_db()
 
-    # Render Logic
+# Initialize the Telegram App globally so Flask can see it
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+# Define Handlers
+conv = ConversationHandler(
+    entry_points=[CommandHandler('start', start)],
+    states={
+        MENU: [CallbackQueryHandler(button_tap), MessageHandler(filters.Document.PDF, handle_pdf)],
+        BUY_PACK: [CallbackQueryHandler(select_package)],
+        WAIT_RECEIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_receipt)]
+    },
+    fallbacks=[CommandHandler('start', start)]
+)
+
+app.add_handler(conv)
+app.add_handler(CallbackQueryHandler(admin_approval, pattern="^(appr|rej)_"))
+
+# 2. Add a helper to start the bot's background processes
+async def setup_webhook():
+    URL = os.environ.get("RENDER_EXTERNAL_URL")
+    if URL:
+        await app.bot.set_webhook(url=f"{URL}/webhook")
+        print(f"🚀 Webhook set to {URL}/webhook")
+
+# This logic runs when Gunicorn starts
+import threading
+if os.environ.get("RENDER_EXTERNAL_URL"):
+    # Run the webhook setup in the background
+    import asyncio
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=lambda: loop.run_until_complete(app.initialize())).start()
+
+# 3. Keep the main block ONLY for local testing (VS Code)
+if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 10000))
-    # If RENDER_EXTERNAL_URL exists, we are on the cloud
     URL = os.environ.get("RENDER_EXTERNAL_URL") 
 
-    if URL:
-        print(f"🚀 Deployment Mode: Webhook on {URL}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="webhook",
-            webhook_url=f"{URL}/webhook"
-        )
-    else:
+    if not URL:
         print("🚀 Local Mode: Polling")
         app.run_polling()
