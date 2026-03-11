@@ -2,6 +2,7 @@ python-telegram-bot
 flask
 gunicorn
 pymupdf
-rembg
+rembg[cpu]
 pillow
 ethiopian-date
+onnxruntime
